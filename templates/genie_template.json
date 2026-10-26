@@ -1,0 +1,86 @@
+{
+  "title": "Job Benchmark Advisor",
+  "description": "Ask about job benchmark results: best balance of cost vs task-only runtime, Pareto front, recommended config changes, and trends across benchmarks.",
+  "serialized_space": {
+    "version": 2,
+    "config": {
+      "sample_questions": [
+        {"id": "10000000000000000000000000000001", "question": ["What is the best balance of cost and task-only runtime?"]},
+        {"id": "10000000000000000000000000000002", "question": ["What changes should I make to the baseline job?"]},
+        {"id": "10000000000000000000000000000003", "question": ["Which variants are on the Pareto front for task-only time?"]},
+        {"id": "10000000000000000000000000000004", "question": ["How much of total runtime is cluster startup per variant?"]},
+        {"id": "10000000000000000000000000000005", "question": ["Which variants should I confirm with more runs?"]}
+      ]
+    },
+    "data_sources": {
+      "tables": [
+        {"identifier": "__BENCH_FQN__.rpt_recommendations"},
+        {"identifier": "__BENCH_FQN__.rpt_runs"},
+        {"identifier": "__BENCH_FQN__.rpt_variant_results"}
+      ]
+    },
+    "instructions": {
+      "text_instructions": [
+        {
+          "id": "30000000000000000000000000000001",
+          "content": [
+            "You help engineers choose Databricks job cluster configurations from benchmark results.\n",
+            "Tables:\n",
+            "- rpt_variant_results: one row per benchmark_id x variant_name (median of successful runs). Main table.\n",
+            "- rpt_runs: one row per individual benchmark job run (for run-to-run detail and run status).\n",
+            "- rpt_recommendations: latest AI-written recommendation (markdown) per benchmark. When asked what to change, what is recommended, or for a summary, return recommendation_md for the benchmark.\n",
+            "Definitions:\n",
+            "- task_only_min = wall-clock minutes while at least one task was executing (excludes cluster startup). This is the PRIMARY time metric unless the user asks about total/end-to-end time.\n",
+            "- total_min = wall clock including cluster startup; startup_overhead_min = total_min - task_only_min.\n",
+            "- cost_usd = estimated USD per run (DBU + VM), includes startup.\n",
+            "- *_vs_base_pct: percent vs the baseline variant (is_baseline = true). Negative = faster/cheaper.\n",
+            "- Differences within 5% of baseline are noise.\n",
+            "- n_runs = 1 means screening only (not confirmed).\n",
+            "- vm_cost_suspect = true: VM cost is understated due to missing telemetry. Never call such a variant the cheapest; exclude it from cost rankings and mention why.\n",
+            "- is_pareto_task_only: on the cost vs task-only time Pareto front (not beaten on both). picks_task_only lists roles: fastest, cheapest, best_balance.\n",
+            "- overrides_json = the exact cluster settings changed vs the baseline (what to edit in git).\n",
+            "- code_version labels the job code under test; compare benchmarks over time by benchmark_id/code_version ordered by first_run_at.\n",
+            "Default to the most recent benchmark (max first_run_at) when the user does not name one. Round minutes to 2 dp, cost to 2 dp USD, percentages to 1 dp.\n",
+            "This agent is read-only: it cannot start benchmark runs. If asked to run experiments, explain they are started from the 04_orchestrator notebook (variants_filter, max_runs) and suggest which variants to include."
+          ]
+        }
+      ],
+      "example_question_sqls": [
+        {
+          "id": "20000000000000000000000000000001",
+          "question": ["What changes should I make to the baseline?"],
+          "sql": ["SELECT benchmark_id, generated_at, recommendation_md FROM __BENCH_FQN__.rpt_recommendations WHERE benchmark_id = (SELECT benchmark_id FROM __BENCH_FQN__.rpt_variant_results ORDER BY first_run_at DESC LIMIT 1)"]
+        },
+        {
+          "id": "20000000000000000000000000000002",
+          "question": ["Show the cost vs task-only time Pareto front"],
+          "sql": [
+            "SELECT variant_name, task_only_min, cost_usd, task_only_vs_base_pct, cost_vs_base_pct, pareto_class_task_only, picks_task_only\n",
+            "FROM __BENCH_FQN__.rpt_variant_results WHERE benchmark_id = (SELECT benchmark_id FROM __BENCH_FQN__.rpt_variant_results ORDER BY first_run_at DESC LIMIT 1)\n",
+            "ORDER BY is_pareto_task_only DESC, task_only_min"
+          ]
+        },
+        {
+          "id": "20000000000000000000000000000003",
+          "question": ["Which variants are cheaper than baseline without being slower?"],
+          "sql": [
+            "SELECT variant_name, task_only_vs_base_pct, cost_vs_base_pct, overrides_json\n",
+            "FROM __BENCH_FQN__.rpt_variant_results\n",
+            "WHERE benchmark_id = (SELECT benchmark_id FROM __BENCH_FQN__.rpt_variant_results ORDER BY first_run_at DESC LIMIT 1) AND NOT is_baseline AND NOT vm_cost_suspect\n",
+            "  AND cost_vs_base_pct < -5 AND task_only_vs_base_pct < 5\n",
+            "ORDER BY cost_vs_base_pct"
+          ]
+        },
+        {
+          "id": "20000000000000000000000000000004",
+          "question": ["How has the baseline changed across benchmarks over time?"],
+          "sql": [
+            "SELECT benchmark_id, code_version, min(first_run_at) AS run_date, task_only_min, total_min, cost_usd\n",
+            "FROM __BENCH_FQN__.rpt_variant_results WHERE is_baseline\n",
+            "GROUP BY ALL ORDER BY run_date"
+          ]
+        }
+      ]
+    }
+  }
+}
