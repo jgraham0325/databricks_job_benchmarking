@@ -9,6 +9,10 @@ Every notebook in this folder starts with:
 Nothing here is tied to one workspace. The catalog, schema, output catalog and job-name prefix come
 from widgets (or job parameters with the same names), and Azure node types come from the workspace
 itself via the Clusters API.
+
+The workspace client is created on first use (bc.w or bc.client()), so this module and the pure-logic
+modules (bench_variants, bench_copier, bench_orchestration, bench_analysis) import without a workspace,
+which is what the unit tests in ../tests rely on.
 """
 import json
 import math
@@ -16,9 +20,23 @@ import re
 import uuid
 from types import SimpleNamespace
 
-from databricks.sdk import WorkspaceClient
+_w = None
 
-w = WorkspaceClient()
+
+def client():
+    """Shared WorkspaceClient, created on first use."""
+    global _w
+    if _w is None:
+        from databricks.sdk import WorkspaceClient
+        _w = WorkspaceClient()
+    return _w
+
+
+def __getattr__(name):
+    # Keeps `bc.w` working in the notebooks without creating a client at import time
+    if name == "w":
+        return client()
+    raise AttributeError(f"module 'bench_common' has no attribute {name!r}")
 
 _IDENT = re.compile(r"^[A-Za-z0-9_]+$")
 
@@ -141,11 +159,17 @@ def _set_feat(feat, flag, on):
 _catalog = {}
 
 
+def set_node_catalog(entries):
+    """Replace the cached node catalog: {node_type_id: dict(cores, mem_mb, gpus, deprecated)}. Used by tests."""
+    _catalog.clear()
+    _catalog.update(entries)
+
+
 def load_node_catalog():
     """Node types available in this workspace (cached)."""
     if _catalog:
         return _catalog
-    for nt in w.clusters.list_node_types().node_types:
+    for nt in client().clusters.list_node_types().node_types:
         _catalog[nt.node_type_id] = dict(cores=int(nt.num_cores or 0), mem_mb=nt.memory_mb or 0,
                                          gpus=nt.num_gpus or 0, deprecated=nt.is_deprecated or False)
     active = sum(1 for v in _catalog.values() if not v["deprecated"])

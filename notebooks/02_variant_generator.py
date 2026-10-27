@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # 02 Variant generator
 # MAGIC
@@ -6,10 +10,18 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Reload edited modules automatically
+# Picks up edits to the bench_*.py modules without restarting Python
+%load_ext autoreload
+%autoreload 2
+
+# COMMAND ----------
+
 # DBTITLE 1,Configuration
 import os, sys, json
 sys.path.insert(0, os.getcwd())
 import bench_common as bc
+import bench_variants as bv   # variant rules (tested in ../tests/test_variants.py)
 
 cfg = bc.setup(dbutils, spark)
 w = bc.w
@@ -27,7 +39,7 @@ DBR_CANDIDATES = [v.strip() for v in dbutils.widgets.get("dbr_candidates").split
 VM_GENERATIONS = [int(g) for g in dbutils.widgets.get("vm_generations").split(",") if g.strip()]
 include_serverless = dbutils.widgets.get("include_serverless") == "true"
 serverless_env_version = dbutils.widgets.get("serverless_env_version").strip()
-SERVERLESS_MODES = [("serverless_standard", "STANDARD"), ("serverless_perf_optimized", "PERFORMANCE_OPTIMIZED")]
+SERVERLESS_MODES = bv.SERVERLESS_MODES
 print(f"Benchmark {benchmark_id} | DBR {DBR_CANDIDATES} | VM gens {VM_GENERATIONS} | serverless {include_serverless} (env v{serverless_env_version})")
 
 # COMMAND ----------
@@ -46,207 +58,20 @@ for jid, jc in job_clusters.items():
 # COMMAND ----------
 
 # DBTITLE 1,Generate one-factor-at-a-time variants
-def _variant(name, dimension, desc, overrides, valid=True, reason=None):
-    return dict(variant_name=name, dimension=dimension, description=desc, overrides=overrides,
-                is_valid=valid, invalid_reason=reason)
-
-def _per_cluster(clusters, name, dimension, desc, fn):
-    """Apply fn to every cluster; the variant is invalid if fn returns None for any of them."""
-    overrides = {}
-    for c in clusters:
-        r = fn(c)
-        if r is None:
-            return _variant(name, dimension, desc, {}, False, f"No matching node type for {c['job_cluster_key']} ({c['worker_node_type']})")
-        overrides[c["job_cluster_key"]] = r
-    return _variant(name, dimension, desc, overrides)
-
-# Serverless ----------------------------------------------------------------------------------------
-# Spark confs serverless accepts only at session level (set in code), never on the job.
-SERVERLESS_SESSION_CONFS = {"spark.sql.shuffle.partitions", "spark.sql.session.timeZone", "spark.sql.ansi.enabled",
-                            "spark.sql.legacy.timeParserPolicy", "spark.sql.files.maxPartitionBytes",
-                            "spark.databricks.execution.timeout"}
-TASK_TYPES = ["notebook_task", "spark_jar_task", "spark_python_task", "python_wheel_task", "spark_submit_task",
-              "sql_task", "dbt_task", "pipeline_task", "run_job_task", "condition_task", "for_each_task",
-              "dashboard_task", "power_bi_task", "clean_rooms_notebook_task"]
-NO_COMPUTE_TASKS = {"sql_task", "pipeline_task", "run_job_task", "condition_task", "dashboard_task", "power_bi_task"}
-
-def _serverless_variant(job_id, clusters, variant_name, perf):
-    """Move every task to serverless jobs compute. Builds a per-task plan that 03_job_copier applies.
-    Anything that can't run on serverless becomes a blocker (is_valid = false with the reason)."""
-    s = w.api_client.do("GET", "/api/2.2/jobs/get", query={"job_id": int(job_id)})["settings"]
-    cl = {c["job_cluster_key"]: c for c in clusters}
-    blockers, notes, plan = [], [], {}
-    for t in s.get("tasks", []):
-        k = t["task_key"]
-        ttype = next((x for x in TASK_TYPES if x in t), "unknown")
-        libs = t.get("libraries") or []
-        p = {"type": ttype}
-        if t.get("job_cluster_key"):
-            dbr = (cl.get(t["job_cluster_key"]) or {}).get("spark_version") or ""
-        elif t.get("new_cluster"):
-            dbr = t["new_cluster"].get("spark_version", "")
-        elif t.get("existing_cluster_id"):
-            try:
-                dbr = w.clusters.get(t["existing_cluster_id"]).spark_version or ""
-            except Exception:
-                dbr = ""
-            notes.append(f"{k}: was on an all-purpose cluster")
-        else:
-            dbr = ""
-        if ttype == "spark_jar_task":
-            if "scala2.13" not in dbr:
-                blockers.append(f"{k}: JAR built for {dbr or 'unknown DBR/Scala'}; serverless env {serverless_env_version} "
-                                f"needs a JAR compiled for Scala 2.13 + JDK 17 using public Spark APIs only")
-            jars = [l["jar"] for l in libs if "jar" in l]
-            other = [list(l)[0] for l in libs if "jar" not in l]
-            if other:
-                blockers.append(f"{k}: libraries {other} are not moved automatically; package them into the JAR or upload JARs to a UC volume")
-            if not jars:
-                blockers.append(f"{k}: no JAR library found to put in the serverless environment")
-            p["java_dependencies"] = jars
-        elif ttype in ("spark_python_task", "python_wheel_task"):
-            deps = []
-            for l in libs:
-                if "whl" in l: deps.append(l["whl"])
-                elif "pypi" in l and not l["pypi"].get("repo"): deps.append(l["pypi"]["package"])
-                elif "requirements" in l: deps.append(f"-r {l['requirements']}")
-                else: blockers.append(f"{k}: library {l} has no serverless environment equivalent")
-            p["dependencies"] = deps
-        elif ttype == "notebook_task":
-            if libs:
-                blockers.append(f"{k}: notebook task libraries aren't supported on serverless; use %pip or the notebook environment")
-        elif ttype == "spark_submit_task":
-            blockers.append(f"{k}: spark_submit_task is not supported on serverless")
-        elif ttype == "dbt_task":
-            p["dependencies"] = ["dbt-databricks"]
-            notes.append(f"{k}: dbt task gets dbt-databricks in its environment (check the version)")
-        elif ttype == "for_each_task":
-            blockers.append(f"{k}: for_each_task nested tasks are not converted automatically")
-        elif ttype not in NO_COMPUTE_TASKS:
-            blockers.append(f"{k}: task type {ttype} not handled for serverless")
-        plan[k] = p
-    for c in clusters:
-        conf = json.loads(c.get("spark_conf_json") or "{}")
-        if conf:
-            sess = sorted(x for x in conf if x in SERVERLESS_SESSION_CONFS)
-            other = sorted(x for x in conf if x not in SERVERLESS_SESSION_CONFS)
-            msg = f"{c['job_cluster_key']} spark_conf dropped"
-            if sess: msg += f" (session-settable in code: {', '.join(sess)})"
-            if other: msg += f" (not available on serverless: {', '.join(other)})"
-            notes.append(msg)
-        if json.loads(c.get("init_scripts_json") or "[]"):
-            notes.append(f"{c['job_cluster_key']}: init scripts dropped (not supported on serverless)")
-    notes.append("node types, Spot, DBR, Photon (always on) and access mode are managed by serverless")
-    desc = (f"All tasks on serverless jobs compute, env v{serverless_env_version}, {perf} mode"
-            + (" (4-6 min startup)" if perf == "STANDARD" else " (fast startup, higher price)")
-            + " | " + "; ".join(notes))
-    return _variant(variant_name, "serverless", desc,
-                    {"_serverless": {"performance_target": perf, "environment_version": serverless_env_version, "tasks": plan}},
-                    not blockers, "; ".join(blockers) or None)
-
-def generate_variants(job_id, clusters):
-    v = [_variant("baseline", "baseline", "Original config (availability as in the source job)", {})]
-
-    # Shape: worker size x2 / x0.5, worker counts rescaled by the core ratio so total worker cores match.
-    # Fixed counts and autoscale min/max are scaled separately; inexact bounds are rounded (min 1 worker)
-    # and written into the description. The driver keeps its size, so only the worker shape varies.
-    def _shape(name, factor, desc):
-        mism = []
-        def fn(c):
-            new = bc.scale_vm(c["worker_node_type"], factor)
-            oc, nc = bc.cores_of(c["worker_node_type"]), bc.cores_of(new) if new else None
-            if not new or not oc or not nc:
-                return None
-            o = {"worker_node_type": new}
-            def sc(n, label):
-                k, exact = bc.scale_workers(n, oc, nc)
-                if not exact: mism.append(f"{c['job_cluster_key']} {label} {n}x{oc}c -> {k}x{nc}c")
-                return k
-            if c.get("min_workers") is not None:
-                o["min_workers"], o["max_workers"] = sc(int(c["min_workers"]), "min"), sc(int(c["max_workers"]), "max")
-            else:
-                o["num_workers"] = sc(int(c.get("num_workers") or 1), "workers")
-            return o
-        r = _per_cluster(clusters, name, "shape", desc, fn)
-        if r["is_valid"] and mism:
-            r["description"] += " | worker capacity differs from baseline: " + "; ".join(mism)
-        return r
-    v.append(_shape("half_workers_2x_size", 2.0, "Half the workers, each 2x the size"))
-    v.append(_shape("2x_workers_half_size", 0.5, "Double the workers, each half the size"))
-
-    # Autoscaling off: autoscaling clusters fixed at max_workers. Skipped when nothing autoscales.
-    asc = [c for c in clusters if c.get("min_workers") is not None and c.get("max_workers") is not None]
-    if asc:
-        v.append(_variant("autoscale_off", "autoscale", "Autoscaling off, fixed at max_workers (" + ", ".join(
-            f"{c['job_cluster_key']} {int(c['min_workers'])}-{int(c['max_workers'])} -> {int(c['max_workers'])}" for c in asc) + ")",
-            {c["job_cluster_key"]: {"num_workers": int(c["max_workers"])} for c in asc}))
-
-    # VM generation (driver follows when available)
-    gens = {bc.parse_vm(c["worker_node_type"])["gen"] for c in clusters if bc.parse_vm(c["worker_node_type"])}
-    for g in VM_GENERATIONS:
-        if len(gens) == 1 and g in gens:
-            continue
-        def fn(c, g=g):
-            nw = bc.change_gen(c["worker_node_type"], g)
-            return None if not nw else {"worker_node_type": nw, "driver_node_type": bc.change_gen(c["driver_node_type"], g) or c["driver_node_type"]}
-        v.append(_per_cluster(clusters, f"vm_v{g}", "vm_gen", f"VM generation v{g}", fn))
-
-    # Delta cache (local SSD 'd' VMs) toggled from the first cluster's current state
-    p0 = bc.parse_vm(clusters[0]["worker_node_type"])
-    if p0:
-        en = not p0["has_cache"]
-        st = "on" if en else "off"
-        def fn(c, en=en):
-            nw = bc.toggle_cache(c["worker_node_type"], en)
-            return None if not nw else {"worker_node_type": nw, "driver_node_type": bc.toggle_cache(c["driver_node_type"], en) or c["driver_node_type"]}
-        v.append(_per_cluster(clusters, f"cache_{st}", "cache", f"Delta cache {st} (local SSD {'enabled' if en else 'disabled'})", fn))
-
-    # Availability: on-demand -> Spot with fallback only (Spot clusters are never benchmarked as on-demand)
-    od = [c for c in clusters if "SPOT" not in (c.get("azure_availability") or "ON_DEMAND_AZURE")]
-    if od:
-        v.append(_variant("spot_with_fallback", "availability",
-                          f"Spot with fallback for on-demand clusters ({', '.join(c['job_cluster_key'] for c in od)})",
-                          {c["job_cluster_key"]: {"azure_availability": "SPOT_WITH_FALLBACK_AZURE",
-                                                  "first_on_demand": int(c.get("first_on_demand") or 1)} for c in od}))
-
-    # Photon toggle
-    engines = {c.get("runtime_engine") or "STANDARD" for c in clusters}
-    new_engine = "STANDARD" if "PHOTON" in engines else "PHOTON"
-    on = new_engine == "PHOTON"
-    v.append(_variant(f"photon_{'on' if on else 'off'}", "photon", f"Photon {'enabled' if on else 'disabled'}",
-                      {c["job_cluster_key"]: {"runtime_engine": new_engine} for c in clusters}))
-
-    # DBR versions
-    current = {c.get("spark_version") for c in clusters}
-    for dbr in DBR_CANDIDATES:
-        if current == {dbr}:
-            continue
-        short = dbr.split(".x")[0]
-        v.append(_variant(f"dbr_{short.replace('.', '_')}", "dbr", f"DBR {short} ({dbr})",
-                          {c["job_cluster_key"]: {"spark_version": dbr} for c in clusters}))
-
-    # Shuffle partitions: auto (auto-optimized shuffle) and 200 (Spark default); skipped if already set everywhere
-    def _shuffle(c):
-        return json.loads(c.get("spark_conf_json") or "{}").get("spark.sql.shuffle.partitions", "200")
-    for name, val, desc in [("shuffle_auto", "auto", "shuffle.partitions=auto (auto-optimized shuffle)"),
-                            ("shuffle_200", "200", "shuffle.partitions=200 (Spark default)")]:
-        if all(_shuffle(c) == val for c in clusters):
-            continue
-        v.append(_variant(name, "shuffle", desc,
-                          {c["job_cluster_key"]: {"spark_conf_add": {"spark.sql.shuffle.partitions": val}} for c in clusters}))
-
-    if include_serverless:
-        for name, mode in SERVERLESS_MODES:
-            v.append(_serverless_variant(job_id, clusters, name, mode))
-
-    for x in v:
-        x.update(benchmark_id=benchmark_id, source_job_id=str(job_id), variant_id=f"{benchmark_id}_{x['variant_name']}",
-                 overrides_json=json.dumps(x.pop("overrides")))
-    return v
+# The rules (shape, autoscale, VM generation, cache, Spot, Photon, DBR, shuffle, serverless) live in
+# bench_variants.generate_variants and are unit tested in ../tests/test_variants.py. This cell only does the I/O.
+def _cluster_dbr(cluster_id):
+    """DBR of an all-purpose cluster (tasks with existing_cluster_id, for the serverless check)."""
+    return w.clusters.get(cluster_id).spark_version
 
 all_variants = []
 for jid, jc in job_clusters.items():
-    vs = generate_variants(jid, jc)
+    settings = (w.api_client.do("GET", "/api/2.2/jobs/get", query={"job_id": int(jid)})["settings"]
+                if include_serverless else None)
+    vs = bv.generate_variants(jid, jc, benchmark_id=benchmark_id, vm_generations=VM_GENERATIONS,
+                              dbr_candidates=DBR_CANDIDATES, include_serverless=include_serverless,
+                              serverless_env_version=serverless_env_version, job_settings=settings,
+                              cluster_dbr=_cluster_dbr)
     all_variants.extend(vs)
     print(f"Job {jid}: {len(vs)} variants ({sum(x['is_valid'] for x in vs)} valid)")
 

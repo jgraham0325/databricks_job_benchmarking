@@ -1,0 +1,4 @@
+# Test dependencies for the offline unit tests (pytest from this folder). Databricks runtimes already have these.
+pytest>=8
+pandas>=2.0
+numpy>=1.26

@@ -31,7 +31,7 @@ Details: [references/variants.md](references/variants.md).
 ## Install
 
 1. Push this folder to a git repository.
-2. In the workspace, create a **Git folder** from the repo (Workspace > Create > Git folder). Files with a `# Databricks notebook source` header become notebooks; `notebooks/bench_common.py` stays a Python module.
+2. In the workspace, create a **Git folder** from the repo (Workspace > Create > Git folder). Files with a `# Databricks notebook source` header become notebooks; `notebooks/bench_*.py` stay Python modules.
 3. Optional, for Genie Code: put (or clone) the folder at `/Workspace/Users/<you>/.assistant/skills/job-benchmarking/` (or the workspace-level skills folder) so Genie Code picks up `SKILL.md`.
 
 ## Quick start
@@ -59,6 +59,17 @@ Everything is idempotent and keyed by `benchmark_id`; several benchmarks (or job
 * Inputs are read directly. List them in `input_tables` (04) to check their Delta versions did not change during the benchmark.
 * Cleanup is manual: delete the benchmark jobs listed in `bench_jobs` and drop their output schemas.
 
+## Tests
+
+The decision logic lives in plain Python modules next to the notebooks; the notebooks only read widgets, call the APIs and write tables. The modules have no Spark or workspace dependency, so their tests run in about two seconds:
+
+* In the workspace: open any file in `tests/` and use the Tests pane (run all, run failed, or run a single test), or run `pytest` from this folder in a web terminal.
+* Locally or in CI: `pip install -r requirements-dev.txt && pytest`. `.github/workflows/tests.yml` runs them on every push to `main` and on every pull request (no secrets needed).
+
+When you change a rule, change the module and its test together. `tests/fixtures/bf1e865e.json` is a recorded real benchmark (job settings, clusters, node types and the variants it produced). If a change is meant to alter the variants for that job, update `expected_variants` in the same commit, so the diff shows the behaviour change.
+
+The notebooks load `%autoreload 2`, so edits to the modules are picked up without restarting Python.
+
 ## Layout
 
 ```
@@ -66,8 +77,14 @@ SKILL.md                     Genie Code skill entry point
 README.md                    this file
 notebooks/
   bench_common.py            shared config widgets + Azure VM helpers (module)
+  bench_variants.py          variant generation rules, incl. serverless blockers (used by 02)
+  bench_copier.py            job copy: overrides, isolation, tags, serverless conversion (used by 03)
+  bench_orchestration.py     run timing, run queue, batches, code version (used by 04)
+  bench_analysis.py          cost flags, Pareto, picks, confidence, verdicts (used by 05)
   00_setup_cost_model.py     VM prices + job run cost view
   01_discovery.py ... 06_deploy_reporting.py
+tests/                       pytest unit tests for the bench_*.py modules (+ fixtures/)
+pytest.ini, requirements-dev.txt, .github/workflows/tests.yml
 templates/
   dashboard_template.json    AI/BI dashboard (tokens __BENCH_FQN__, __GENIE_SPACE_ID__)
   genie_template.json        Genie agent (token __BENCH_FQN__)

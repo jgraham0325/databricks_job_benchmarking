@@ -13,10 +13,18 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Reload edited modules automatically
+# Picks up edits to the bench_*.py modules without restarting Python
+%load_ext autoreload
+%autoreload 2
+
+# COMMAND ----------
+
 # DBTITLE 1,Configuration, tracking tables, sync and run queue
 import os, sys, json, time, random
 sys.path.insert(0, os.getcwd())
 import bench_common as bc
+import bench_orchestration as bo   # run timing, queue, batches, code version (tested in ../tests/test_orchestration.py)
 from datetime import datetime, timezone
 from delta.tables import DeltaTable
 from pyspark.sql import functions as F
@@ -81,20 +89,6 @@ if variant_filter:
     assert not unknown, f"Unknown variants in variants_filter: {sorted(unknown)} (have {sorted(all_jobs)})"
 bench_jobs = {k: v for k, v in all_jobs.items() if not variant_filter or k in variant_filter}
 
-def _ts(ms):
-    return datetime.fromtimestamp(ms / 1000, timezone.utc) if ms else None
-
-def _union_seconds(intervals):
-    total, cs, ce = 0.0, None, None
-    for s, e in sorted(i for i in intervals if i[0] and i[1] and i[1] > i[0]):
-        if ce is None or s > ce:
-            if ce is not None: total += (ce - cs).total_seconds()
-            cs, ce = s, e
-        else:
-            ce = max(ce, e)
-    if ce is not None: total += (ce - cs).total_seconds()
-    return total
-
 def _merge(rows, ddl, tbl, key):
     if rows:
         (DeltaTable.forName(spark, tbl).alias("t").merge(spark.createDataFrame(rows, ddl).alias("s"), f"t.{key} = s.{key}")
@@ -106,30 +100,16 @@ def sync_runs(jobs):
     for vname, j in jobs.items():
         runs = sorted(w.jobs.list_runs(job_id=int(j["new_job_id"]), expand_tasks=True), key=lambda r: r.start_time or 0)
         for n, r in enumerate(runs, 1):
-            lcs, rs = bc.ev(r.state.life_cycle_state), bc.ev(r.state.result_state)
-            st, et = _ts(r.start_time), _ts(r.end_time)
-            terminal = lcs in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")
-            # SKIPPED (e.g. max concurrent runs reached) never ran: not a failure, and it is re-queued
-            status = ("SKIPPED" if lcs == "SKIPPED" else "SUCCESS" if rs == "SUCCESS" else "FAILED") if terminal else "RUNNING"
-            intervals, exec_sum, max_setup = [], 0, 0
-            for t in (r.tasks or []):
-                setup_ms, exec_ms = t.setup_duration or 0, t.execution_duration or 0
-                xs = _ts(t.start_time + setup_ms) if t.start_time else None
-                xe = _ts(t.start_time + setup_ms + exec_ms) if t.start_time and exec_ms else None
-                intervals.append((xs, xe))
-                exec_sum += exec_ms // 1000
-                max_setup = max(max_setup, setup_ms // 1000)
-                task_rows.append((benchmark_id, vname, str(r.run_id), str(t.run_id), t.task_key, t.attempt_number or 0,
-                                  getattr(t, "job_cluster_key", None), t.cluster_instance.cluster_id if getattr(t, "cluster_instance", None) else None,
-                                  _ts(t.start_time), xs, xe, (getattr(t, "queue_duration", None) or 0) // 1000, setup_ms // 1000,
-                                  exec_ms // 1000, (t.cleanup_duration or 0) // 1000,
-                                  bc.ev(t.state.result_state) if t.state else None, now))
-            dur = int((et - st).total_seconds()) if st and et else None
-            task_only = int(_union_seconds(intervals)) if terminal else None
-            run_rows.append((benchmark_id, vname, j["variant_id"], str(j["new_job_id"]), str(r.run_id), n, j["output_schema"],
-                             st, et, dur, task_only, exec_sum if terminal else None,
-                             dur - task_only if dur is not None and task_only is not None else None,
-                             max_setup, len(r.tasks or []), lcs, rs, (r.state.state_message or "")[:500], status, now))
+            m = bo.run_metrics(r)   # timing and SUCCESS / FAILED / SKIPPED / RUNNING status
+            for t in m["tasks"]:
+                task_rows.append((benchmark_id, vname, m["run_id"], t["task_run_id"], t["task_key"], t["attempt_number"],
+                                  t["job_cluster_key"], t["cluster_id"], t["task_start"], t["exec_start"], t["exec_end"],
+                                  t["queue_seconds"], t["setup_seconds"], t["execution_seconds"], t["cleanup_seconds"],
+                                  t["result_state"], now))
+            run_rows.append((benchmark_id, vname, j["variant_id"], str(j["new_job_id"]), m["run_id"], n, j["output_schema"],
+                             m["start_time"], m["end_time"], m["duration_seconds"], m["task_only_seconds"],
+                             m["task_exec_sum_seconds"], m["overhead_seconds"], m["max_setup_seconds"], m["n_tasks"],
+                             m["life_cycle_state"], m["result_state"], m["state_message"], m["status"], now))
     _merge(run_rows, RUNS_SCHEMA, RUNS_TBL, "run_id")
     _merge(task_rows, TASKS_SCHEMA, TASKS_TBL, "task_run_id")
     return len(run_rows)
@@ -137,10 +117,7 @@ def sync_runs(jobs):
 print(f"Synced {sync_runs(all_jobs)} existing run(s) from the Jobs API")
 existing_counts = {r["variant_name"]: r["count"] for r in spark.table(RUNS_TBL).filter(f"benchmark_id = '{benchmark_id}'")
                    .filter(F.col("status").isin("SUCCESS", "RUNNING")).groupBy("variant_name").count().collect()}
-run_queue = []
-for vname, job in bench_jobs.items():
-    done = existing_counts.get(vname, 0)
-    run_queue += [(vname, job, n) for n in range(done + 1, max_runs + 1)]
+run_queue = bo.build_queue(bench_jobs, existing_counts, max_runs)
 if shuffle:
     random.shuffle(run_queue)
 print(f"Benchmark {benchmark_id} | mode {run_mode} | batch {batch_size} | runs/variant {max_runs} | dry run {dry_run}")
@@ -197,38 +174,11 @@ def _file_item(path):
         return f"unreadable:{type(e).__name__}", None
 
 def code_manifest(job_id):
+    """(manifest, newest modified ms) for a benchmark job; the manifest rules are in bench_orchestration."""
     s = w.api_client.do("GET", "/api/2.2/jobs/get", query={"job_id": int(job_id)})["settings"]
-    man, newest = {}, 0
-    gs = s.get("git_source")
-    if gs:
-        man["git_source"] = f"{gs.get('git_url')}@" + (gs.get("git_commit") or gs.get("git_tag") or f"branch:{gs.get('git_branch')}")
-    for t in s.get("tasks", []):
-        k, paths = t["task_key"], []
-        if "notebook_task" in t and t["notebook_task"].get("source", "WORKSPACE") == "WORKSPACE":
-            paths.append(("ws", t["notebook_task"]["notebook_path"]))
-        if "spark_python_task" in t and t["spark_python_task"].get("source", "WORKSPACE") == "WORKSPACE":
-            p = t["spark_python_task"]["python_file"]
-            paths.append(("file", p) if p.startswith("/Volumes/") else ("ws", p))
-        if "spark_jar_task" in t:
-            man[f"{k}:main_class"] = t["spark_jar_task"].get("main_class_name")
-        for lib in t.get("libraries") or []:
-            for typ in ("jar", "whl", "egg", "requirements"):
-                if typ in lib: paths.append(("file", lib[typ]))
-            if "maven" in lib: man[f"{k}:maven"] = lib["maven"].get("coordinates")
-            if "pypi" in lib: man[f"{k}:pypi"] = lib["pypi"].get("package")
-        for env in s.get("environments", []):
-            if env["environment_key"] == t.get("environment_key"):
-                for dep in env["spec"].get("java_dependencies", []) + env["spec"].get("dependencies", []):
-                    if dep.startswith("/"): paths.append(("file", dep))
-                    else: man[f"{k}:dep:{dep}"] = dep
-        for kind, p in paths:
-            fp, ts = _ws_item(p) if kind == "ws" else _file_item(p)
-            man[f"{k}:{p}"] = fp
-            newest = max(newest, ts or 0)
-    return man, newest
+    return bo.code_manifest(s, _ws_item, _file_item)
 
-def _version(man):
-    return hashlib.sha256(json.dumps(man, sort_keys=True).encode()).hexdigest()[:12]
+_version = bo.code_version
 
 def record_code_version(vname, run_id, man, source="captured_at_submit"):
     _merge([(benchmark_id, vname, str(run_id), _version(man), code_label, json.dumps(man, sort_keys=True), source,
@@ -276,7 +226,7 @@ else:
 
 # DBTITLE 1,Execute benchmark runs
 results = []
-TERMINAL = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+TERMINAL = bo.TERMINAL
 
 def _submit(vname, job, run_number):
     try:
@@ -319,13 +269,7 @@ elif run_mode == "parallel":
     _poll([(vn, _submit(vn, j, rn)) for vn, j, rn in run_queue])
 else:
     # A variant appears at most once per batch (benchmark jobs allow one concurrent run)
-    chunks, left = [], list(run_queue)
-    while left:
-        chunk, seen = [], set()
-        for item in list(left):
-            if len(chunk) < batch_size and item[0] not in seen:
-                chunk.append(item); seen.add(item[0]); left.remove(item)
-        chunks.append(chunk)
+    chunks = bo.make_batches(run_queue, batch_size)
     for bi, chunk in enumerate(chunks, 1):
         print(f"\nBatch {bi}/{len(chunks)} ({len(chunk)} runs)")
         _poll([(vn, _submit(vn, j, rn)) for vn, j, rn in chunk])

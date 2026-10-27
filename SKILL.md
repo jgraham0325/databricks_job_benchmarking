@@ -16,7 +16,7 @@ Everything lives in this folder. Nothing is tied to a workspace: catalog, schema
 
 ## Prerequisites to check first
 
-1. The package is in a **Git folder** (or imported as notebooks). The `*.py` files with a `# Databricks notebook source` header must be notebooks; `notebooks/bench_common.py` must stay a plain file (it is imported as a module).
+1. The package is in a **Git folder** (or imported as notebooks). The `*.py` files with a `# Databricks notebook source` header must be notebooks; `notebooks/bench_*.py` must stay plain files (they are imported as modules).
 2. A catalog where the user can create schemas, tables and views (`bench_catalog`), and an output catalog for the per-variant schemas (`output_catalog`, defaults to the same).
 3. SELECT on the system tables used by the cost view: `system.billing` (`usage`, `list_prices`), `system.compute` (`node_timeline`, `clusters`, `node_types`) and `system.lakeflow` (`job_run_timeline`, `jobs`). Without them the benchmark runs but cost is empty.
 4. Outbound HTTPS to `prices.azure.com` from the notebook compute (VM prices), or a pre-loaded price table.
@@ -73,6 +73,20 @@ Notebooks are idempotent: re-running reuses existing jobs (matched by name), ski
 * Never set `dry_run = false` in 03 or 04 without the user's explicit confirmation in the conversation.
 * Never drop `bench_*` tables automatically. 04 stops on a schema mismatch; dropping is the user's decision.
 * Cleanup (deleting benchmark jobs and `<prefix>_<benchmark_id>_*` schemas) is destructive: list what would be deleted and ask first.
+
+## Changing the framework
+
+The rules live in plain modules next to the notebooks and are unit tested; the notebooks only do I/O (widgets, Jobs API, tables).
+
+| Module | Rules | Tests |
+| --- | --- | --- |
+| `bench_common.py` | config validation, Azure VM parsing, scaling, node catalog | `tests/test_bench_common.py` |
+| `bench_variants.py` | every variant dimension, skip/invalid rules, serverless blockers | `tests/test_variants.py` |
+| `bench_copier.py` | overrides, isolated output schema, tags, schedule/notification removal, serverless conversion | `tests/test_copier.py` |
+| `bench_orchestration.py` | task-only time, run status, run queue, batches, code version | `tests/test_orchestration.py` |
+| `bench_analysis.py` | VM cost flags, Pareto, picks, confidence, verdicts, AI model choice | `tests/test_analysis.py` |
+
+When asked to change behaviour: change the module, add or adjust a test that states the new rule, and run `pytest` from the skill folder (about 2 s, no Spark needed) before touching the notebooks. Do not put new decision logic inline in a notebook cell. `tests/fixtures/bf1e865e.json` is a recorded real benchmark: only update its `expected_variants` when the change is meant to alter the generated variants, and say so to the user.
 
 ## Reference files
 

@@ -1,0 +1,101 @@
+{
+  "_about": "Recorded from benchmark bf1e865e (test job 1009720951818848) on 2026-10-27. clusters = bench_source_clusters rows, job_settings = Jobs API 2.2 settings of the source job, expected_variants = overrides stored in bench_variants by the run that produced the benchmark results. node_catalog = only the node types the generator looks up for this job (Standard_D2ds_v5 is looked up and does not exist).",
+  "benchmark_id": "bf1e865e",
+  "job_id": "1009720951818848",
+  "clusters": [
+    {"job_cluster_key": "agg_cluster", "worker_node_type": "Standard_D4ds_v5", "driver_node_type": "Standard_D4ds_v5",
+     "num_workers": null, "min_workers": 1.0, "max_workers": 3.0, "spark_version": "15.4.x-scala2.12",
+     "runtime_engine": "PHOTON", "azure_availability": "SPOT_WITH_FALLBACK_AZURE", "first_on_demand": 1,
+     "spark_conf_json": "{}", "init_scripts_json": "[]"},
+    {"job_cluster_key": "shared_cluster", "worker_node_type": "Standard_E8ds_v5", "driver_node_type": "Standard_E8ds_v5",
+     "num_workers": 4.0, "min_workers": null, "max_workers": null, "spark_version": "15.4.x-scala2.12",
+     "runtime_engine": "STANDARD", "azure_availability": "ON_DEMAND_AZURE", "first_on_demand": 1,
+     "spark_conf_json": "{\"spark.sql.shuffle.partitions\": \"200\", \"spark.databricks.delta.optimizeWrite.enabled\": \"true\"}",
+     "init_scripts_json": "[]"}
+  ],
+  "job_settings": {
+    "name": "[BENCH-TEST] Multi-Task Benchmark Test Job",
+    "email_notifications": {},
+    "webhook_notifications": {},
+    "timeout_seconds": 0,
+    "max_concurrent_runs": 1,
+    "tasks": [
+      {"task_key": "transform_a", "run_if": "ALL_SUCCESS",
+       "notebook_task": {"notebook_path": "/Users/james.graham@databricks.com/job_benchmarking/test_job/task_transform_a",
+                         "base_parameters": {"output_schema": "{{job.parameters.output_schema}}"}, "source": "WORKSPACE"},
+       "job_cluster_key": "shared_cluster", "timeout_seconds": 0, "email_notifications": {}, "disabled": false},
+      {"task_key": "transform_b", "run_if": "ALL_SUCCESS",
+       "notebook_task": {"notebook_path": "/Users/james.graham@databricks.com/job_benchmarking/test_job/task_transform_b",
+                         "base_parameters": {"output_schema": "{{job.parameters.output_schema}}"}, "source": "WORKSPACE"},
+       "job_cluster_key": "shared_cluster", "timeout_seconds": 0, "email_notifications": {}, "disabled": false},
+      {"task_key": "aggregate_c", "depends_on": [{"task_key": "transform_a"}], "run_if": "ALL_SUCCESS",
+       "notebook_task": {"notebook_path": "/Users/james.graham@databricks.com/job_benchmarking/test_job/task_aggregate_c",
+                         "base_parameters": {"output_schema": "{{job.parameters.output_schema}}"}, "source": "WORKSPACE"},
+       "job_cluster_key": "agg_cluster", "timeout_seconds": 0, "email_notifications": {}, "disabled": false}
+    ],
+    "job_clusters": [
+      {"job_cluster_key": "agg_cluster",
+       "new_cluster": {"spark_version": "15.4.x-scala2.12",
+                       "azure_attributes": {"first_on_demand": 1, "availability": "SPOT_WITH_FALLBACK_AZURE"},
+                       "node_type_id": "Standard_D4ds_v5", "driver_node_type_id": "Standard_D4ds_v5",
+                       "enable_elastic_disk": true, "data_security_mode": "SINGLE_USER", "runtime_engine": "PHOTON",
+                       "autoscale": {"min_workers": 1, "max_workers": 3}}},
+      {"job_cluster_key": "shared_cluster",
+       "new_cluster": {"spark_version": "15.4.x-scala2.12",
+                       "spark_conf": {"spark.sql.shuffle.partitions": "200", "spark.databricks.delta.optimizeWrite.enabled": "true"},
+                       "azure_attributes": {"first_on_demand": 1, "availability": "ON_DEMAND_AZURE"},
+                       "node_type_id": "Standard_E8ds_v5", "driver_node_type_id": "Standard_E8ds_v5",
+                       "enable_elastic_disk": true, "data_security_mode": "SINGLE_USER", "runtime_engine": "STANDARD",
+                       "num_workers": 4}}
+    ],
+    "tags": {"purpose": "benchmark_test"},
+    "format": "MULTI_TASK",
+    "queue": {"enabled": true},
+    "parameters": [{"name": "output_schema", "default": "main.jg_benchmarking"}]
+  },
+  "node_catalog": {
+    "Standard_D4ds_v4": {"cores": 4, "mem_mb": 16384, "gpus": 0, "deprecated": false},
+    "Standard_D4ds_v5": {"cores": 4, "mem_mb": 16384, "gpus": 0, "deprecated": false},
+    "Standard_D4ds_v6": {"cores": 4, "mem_mb": 16384, "gpus": 0, "deprecated": false},
+    "Standard_D4s_v5": {"cores": 4, "mem_mb": 16384, "gpus": 0, "deprecated": false},
+    "Standard_D8ds_v5": {"cores": 8, "mem_mb": 32768, "gpus": 0, "deprecated": false},
+    "Standard_E16ds_v5": {"cores": 16, "mem_mb": 131072, "gpus": 0, "deprecated": false},
+    "Standard_E8ds_v4": {"cores": 8, "mem_mb": 65536, "gpus": 0, "deprecated": false},
+    "Standard_E8ds_v5": {"cores": 8, "mem_mb": 65536, "gpus": 0, "deprecated": false},
+    "Standard_E8ds_v6": {"cores": 8, "mem_mb": 65536, "gpus": 0, "deprecated": false},
+    "Standard_E8s_v5": {"cores": 8, "mem_mb": 65536, "gpus": 0, "deprecated": false}
+  },
+  "expected_variants": [
+    {"variant_name": "baseline", "dimension": "baseline", "is_valid": true, "overrides": {}},
+    {"variant_name": "half_workers_2x_size", "dimension": "shape", "is_valid": true, "overrides": {
+      "agg_cluster": {"worker_node_type": "Standard_D8ds_v5", "min_workers": 1, "max_workers": 2},
+      "shared_cluster": {"worker_node_type": "Standard_E16ds_v5", "num_workers": 2}}},
+    {"variant_name": "2x_workers_half_size", "dimension": "shape", "is_valid": false, "overrides": {}},
+    {"variant_name": "autoscale_off", "dimension": "autoscale", "is_valid": true, "overrides": {
+      "agg_cluster": {"num_workers": 3}}},
+    {"variant_name": "vm_v4", "dimension": "vm_gen", "is_valid": true, "overrides": {
+      "agg_cluster": {"worker_node_type": "Standard_D4ds_v4", "driver_node_type": "Standard_D4ds_v4"},
+      "shared_cluster": {"worker_node_type": "Standard_E8ds_v4", "driver_node_type": "Standard_E8ds_v4"}}},
+    {"variant_name": "vm_v6", "dimension": "vm_gen", "is_valid": true, "overrides": {
+      "agg_cluster": {"worker_node_type": "Standard_D4ds_v6", "driver_node_type": "Standard_D4ds_v6"},
+      "shared_cluster": {"worker_node_type": "Standard_E8ds_v6", "driver_node_type": "Standard_E8ds_v6"}}},
+    {"variant_name": "cache_off", "dimension": "cache", "is_valid": true, "overrides": {
+      "agg_cluster": {"worker_node_type": "Standard_D4s_v5", "driver_node_type": "Standard_D4s_v5"},
+      "shared_cluster": {"worker_node_type": "Standard_E8s_v5", "driver_node_type": "Standard_E8s_v5"}}},
+    {"variant_name": "spot_with_fallback", "dimension": "availability", "is_valid": true, "overrides": {
+      "shared_cluster": {"azure_availability": "SPOT_WITH_FALLBACK_AZURE", "first_on_demand": 1}}},
+    {"variant_name": "photon_off", "dimension": "photon", "is_valid": true, "overrides": {
+      "agg_cluster": {"runtime_engine": "STANDARD"}, "shared_cluster": {"runtime_engine": "STANDARD"}}},
+    {"variant_name": "dbr_16_4", "dimension": "dbr", "is_valid": true, "overrides": {
+      "agg_cluster": {"spark_version": "16.4.x-scala2.12"}, "shared_cluster": {"spark_version": "16.4.x-scala2.12"}}},
+    {"variant_name": "shuffle_auto", "dimension": "shuffle", "is_valid": true, "overrides": {
+      "agg_cluster": {"spark_conf_add": {"spark.sql.shuffle.partitions": "auto"}},
+      "shared_cluster": {"spark_conf_add": {"spark.sql.shuffle.partitions": "auto"}}}},
+    {"variant_name": "serverless_standard", "dimension": "serverless", "is_valid": true, "overrides": {
+      "_serverless": {"performance_target": "STANDARD", "environment_version": "4", "tasks": {
+        "transform_a": {"type": "notebook_task"}, "transform_b": {"type": "notebook_task"}, "aggregate_c": {"type": "notebook_task"}}}}},
+    {"variant_name": "serverless_perf_optimized", "dimension": "serverless", "is_valid": true, "overrides": {
+      "_serverless": {"performance_target": "PERFORMANCE_OPTIMIZED", "environment_version": "4", "tasks": {
+        "transform_a": {"type": "notebook_task"}, "transform_b": {"type": "notebook_task"}, "aggregate_c": {"type": "notebook_task"}}}}}
+  ]
+}

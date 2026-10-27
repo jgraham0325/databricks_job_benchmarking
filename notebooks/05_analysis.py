@@ -8,10 +8,18 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Reload edited modules automatically
+# Picks up edits to the bench_*.py modules without restarting Python
+%load_ext autoreload
+%autoreload 2
+
+# COMMAND ----------
+
 # DBTITLE 1,Configuration and runs with cost
 import os, sys, json
 sys.path.insert(0, os.getcwd())
 import bench_common as bc
+import bench_analysis as ba   # picks, verdicts, cost flags (tested in ../tests/test_analysis.py)
 import pandas as pd, numpy as np
 import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
@@ -38,13 +46,7 @@ elif not ai_model:
     try:
         eps = [e for e in bc.w.serving_endpoints.list()
                if e.state and bc.ev(e.state.ready) == "READY" and (e.task or "").endswith("chat")]
-        names = [e.name for e in eps]
-        for pref in ("databricks-claude-sonnet", "databricks-claude", "databricks-meta-llama", "databricks-gpt", "databricks-"):
-            match = sorted((n for n in names if n.startswith(pref)), reverse=True)
-            if match:
-                ai_model = match[0]
-                break
-        ai_model = ai_model or (names[0] if names else "")
+        ai_model = ba.choose_ai_model([e.name for e in eps])
     except Exception as e:
         print(f"Could not list serving endpoints ({type(e).__name__}); AI recommendation skipped")
 print(f"AI model: {ai_model or 'none (AI recommendation skipped)'}")
@@ -77,14 +79,8 @@ runs["task_only_min"] = runs.task_only_seconds / 60
 runs["overhead_min"] = runs.overhead_seconds / 60
 runs["task_share_pct"] = 100 * runs.task_only_seconds / runs.duration_seconds
 runs["cost_pending"] = (runs.status == "SUCCESS") & runs.total_estimated_usd.isna()
-# Serverless: all cost is serverless DBUs (VMs are in the DBU price), so vm_usd = 0 and no node_timeline rows is expected
-runs["is_serverless"] = (runs.compute_type == "SERVERLESS") | (runs.dimension == "serverless")
-runs.loc[runs.is_serverless & runs.total_estimated_usd.notna(), "vm_usd"] = 0.0
-# VM cost is suspect when billed node-hours are far below the classic median (node_timeline rows missing)
-_classic = runs[(runs.status == "SUCCESS") & ~runs.is_serverless]
-_med_nh = _classic.node_hours.median()
-runs["vm_cost_suspect"] = ~runs.is_serverless & ((runs.vm_cost_incomplete == True) | (pd.notna(_med_nh) & (runs.node_hours < 0.4 * _med_nh)))
-runs["vm_cost_suspect"] = runs.vm_cost_suspect.fillna(False).astype(bool)
+# is_serverless (vm_usd = 0) and vm_cost_suspect (node-hours < 40% of the classic median, or cost view incomplete)
+ba.mark_cost_flags(runs)
 
 _vers = sorted(runs.loc[runs.status == "SUCCESS", "run_code_version"].dropna().unique())
 if code_version is None and _vers:
@@ -112,9 +108,7 @@ display(runs[["variant_name", "dimension", "run_number", "run_id", "status", "to
 # COMMAND ----------
 
 # DBTITLE 1,Per-variant summary (median of successful runs)
-def _spread(s):
-    s = s.dropna()
-    return 100 * (s.max() - s.min()) / s.median() if len(s) > 1 and s.median() else np.nan
+_spread = ba.spread_pct
 
 g = ok.groupby("variant_name")
 summary = pd.DataFrame({
@@ -165,14 +159,7 @@ else:
 # COMMAND ----------
 
 # DBTITLE 1,Chart: cost vs time Pareto
-def pareto_front(df, x, y):
-    """Variants not beaten on both x and y (lower is better)."""
-    d = df.dropna(subset=[x, y]).sort_values([x, y])
-    front, best = [], np.inf
-    for idx, r in d.iterrows():
-        if r[y] < best:
-            front.append(idx); best = r[y]
-    return front
+pareto_front = ba.pareto_front
 
 pc = summary.dropna(subset=["cost_usd", "total_min"])
 if pc.empty:
@@ -200,35 +187,15 @@ else:
 # COMMAND ----------
 
 # DBTITLE 1,Picks and confirmation candidates
+# Rules in bench_analysis (make_picks, comparable_others, confidence); bound to this benchmark's baseline here
 def make_picks(df, tcol):
-    """Fastest, cheapest, best balance (Pareto point closest to the origin, time and cost normalised by the baseline).
-    Variants with suspect VM cost are excluded: their cost is understated, not cheaper."""
-    c = df[~df.vm_cost_suspect.fillna(False).astype(bool)].dropna(subset=[tcol, "cost_usd"])
-    if c.empty:
-        return {}
-    bt = c.loc[baseline, tcol] if baseline in c.index else c[tcol].min()
-    bcost = c.loc[baseline, "cost_usd"] if baseline in c.index else c.cost_usd.min()
-    front = pareto_front(c, tcol, "cost_usd")
-    score = np.sqrt((c.loc[front, tcol] / bt) ** 2 + (c.loc[front, "cost_usd"] / bcost) ** 2)
-    return {"fastest": c[tcol].idxmin(), "cheapest": c.cost_usd.idxmin(), "best_balance": score.idxmin()}
+    return ba.make_picks(df, tcol, baseline)
 
 def comparable_others(basis):
-    c = summary.dropna(subset=[f"{basis}_min", "cost_usd"])
-    return [v for v in c.index if v != baseline]
+    return ba.comparable_others(summary, basis, baseline)
 
 def confidence(v, basis):
-    r, notes = summary.loc[v], []
-    if r.n_runs < 2: notes.append("screening only (1 run)")
-    if r.n_failed: notes.append(f"{r.n_failed} failed run(s)")
-    spread = r[f"{basis}_spread_pct"]
-    if pd.notna(spread) and spread > noise_pct: notes.append(f"run-to-run spread {spread:.0f}%")
-    if v == baseline:
-        notes.append("no variant beat the baseline" if comparable_others(basis) else "no other variants with results yet")
-    else:
-        dt, dc = r[f"{basis}_vs_base_pct"], r.cost_vs_base_pct
-        if pd.notna(dt) and pd.notna(dc) and abs(dt) < noise_pct and abs(dc) < noise_pct:
-            notes.append(f"within {noise_pct:.0f}% of baseline")
-    return "; ".join(notes) or "ok"
+    return ba.confidence(summary, v, basis, baseline, noise_pct)
 
 rows, picks_by_basis = [], {}
 for basis in ["total", "task_only"]:
@@ -305,27 +272,9 @@ res = out[res_cols].copy()
 
 # Every variant is classified in code so the model doesn't have to. A delta counts only beyond the noise
 # threshold; a time delta smaller than the run-to-run spread is reported as noisy. Suspect VM cost is never ranked.
-def _cls(d, better, worse):
-    if pd.isna(d): return "unknown"
-    return better if d < -noise_pct else worse if d > noise_pct else "neutral"
-
+# Verdict rules (WIN / COST WIN / TIME WIN / TRADE-OFF / WORSE / NEUTRAL) live in bench_analysis.verdict
 def verdict(r):
-    if r.variant_name == baseline:
-        return "baseline", "baseline", "baseline"
-    t = _cls(r.task_only_vs_base_pct, "faster", "slower")
-    if t in ("faster", "slower"):
-        noisy = pd.notna(r.task_only_spread_pct) and r.task_only_spread_pct > abs(r.task_only_vs_base_pct)
-        t += " (within run-to-run spread)" if noisy else " (confirmed: larger than run-to-run spread)"
-    c = "unranked (vm_cost_suspect)" if r.vm_cost_suspect else _cls(r.cost_vs_base_pct, "cheaper", "costlier")
-    tf, cf, ts, cs = t.startswith("faster"), c == "cheaper", t.startswith("slower"), c == "costlier"
-    if tf and cf: v = "WIN: faster and cheaper"
-    elif cf and not ts: v = "COST WIN: cheaper, time neutral"
-    elif tf and not cs: v = "TIME WIN: faster" + (", cost unranked" if c.startswith("unranked") else ", cost neutral")
-    elif tf and cs: v = "TRADE-OFF: faster but costlier"
-    elif cf and ts: v = "TRADE-OFF: cheaper but slower"
-    elif ts or cs: v = "WORSE"
-    else: v = "NEUTRAL: within noise on both"
-    return t, c, v
+    return ba.verdict(r, baseline, noise_pct)
 
 res[["time_class", "cost_class", "verdict"]] = res.apply(lambda r: pd.Series(verdict(r)), axis=1)
 res["n_suspect_cost_runs"] = res.variant_name.map(ok.groupby("variant_name").vm_cost_suspect.sum()).fillna(0).astype(int)
