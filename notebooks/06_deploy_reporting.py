@@ -4,6 +4,7 @@
 # MAGIC
 # MAGIC Creates (or updates) the **Job Benchmark Advisor** AI/BI dashboard and Genie agent from `../templates/`, pointed at the `rpt_*` views in your benchmarking schema. Run once after the first `05_analysis`; re-run to push template changes. Asset IDs are stored in `bench_reporting_assets`, so re-runs update in place instead of creating duplicates.
 
+
 # COMMAND ----------
 
 # DBTITLE 1,Configuration
@@ -19,6 +20,7 @@ dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID (blank = first server
 dbutils.widgets.text("parent_path", f"/Users/{me}/job_benchmarking", "Workspace folder for the dashboard and Genie agent")
 dbutils.widgets.text("asset_name", "Job Benchmark Advisor", "Dashboard / Genie agent name")
 dbutils.widgets.dropdown("embed_credentials", "true", ["true", "false"], "Publish with embedded credentials")
+dbutils.widgets.text("default_benchmark_id", "", "Default Benchmark filter value (blank = latest)")
 parent_path = dbutils.widgets.get("parent_path").rstrip("/")
 asset_name = dbutils.widgets.get("asset_name").strip()
 embed = dbutils.widgets.get("embed_credentials") == "true"
@@ -35,12 +37,26 @@ if not warehouse_id:
 for v in ["rpt_variant_results", "rpt_runs", "rpt_recommendations"]:
     assert spark.catalog.tableExists(f"{cfg.fqn}.{v}"), f"{cfg.fqn}.{v} missing: run 05_analysis first"
 
+# Default value of the dashboard's Benchmark filter (single-select, no "All"), so the dashboard never loads empty.
+# Blank = the most recently analysed benchmark. Every re-run of this notebook resets the default to the latest.
+default_benchmark_id = dbutils.widgets.get("default_benchmark_id").strip().lower()
+if not default_benchmark_id:
+    _latest = spark.sql(f"""SELECT benchmark_id FROM {cfg.fqn}.rpt_variant_results
+                            WHERE benchmark_id IS NOT NULL
+                            GROUP BY benchmark_id
+                            ORDER BY MAX(COALESCE(analysed_at, last_run_at)) DESC NULLS LAST
+                            LIMIT 1""").collect()
+    assert _latest, f"{cfg.fqn}.rpt_variant_results is empty: run 05_analysis first"
+    default_benchmark_id = _latest[0].benchmark_id
+print(f"Default Benchmark filter: {default_benchmark_id}")
+
 TEMPLATES = os.path.normpath(os.path.join(os.getcwd(), "..", "templates"))
 def _template(name, **tokens):
     txt = open(os.path.join(TEMPLATES, name)).read()
     for k, v in tokens.items():
         txt = txt.replace(f"__{k}__", v)
-    assert "__BENCH_FQN__" not in txt and "__GENIE_SPACE_ID__" not in txt, f"Unresolved token in {name}"
+    assert not any(t in txt for t in ("__BENCH_FQN__", "__GENIE_SPACE_ID__", "__DEFAULT_BENCHMARK_ID__")), \
+        f"Unresolved token in {name}"
     return txt
 
 w.workspace.mkdirs(parent_path)
@@ -81,7 +97,8 @@ _save("genie", space_id)
 # COMMAND ----------
 
 # DBTITLE 1,Dashboard (create or update, then publish)
-serialized = _template("dashboard_template.json", BENCH_FQN=cfg.fqn, GENIE_SPACE_ID=space_id)
+serialized = _template("dashboard_template.json", BENCH_FQN=cfg.fqn, GENIE_SPACE_ID=space_id,
+                       DEFAULT_BENCHMARK_ID=default_benchmark_id)
 dash_id = known.get(("dashboard", asset_name))
 if dash_id and _exists(f"/api/2.0/lakeview/dashboards/{dash_id}"):
     w.api_client.do("PATCH", f"/api/2.0/lakeview/dashboards/{dash_id}",
