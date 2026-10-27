@@ -120,8 +120,8 @@ def sync_runs(jobs):
                 exec_sum += exec_ms // 1000
                 max_setup = max(max_setup, setup_ms // 1000)
                 task_rows.append((benchmark_id, vname, str(r.run_id), str(t.run_id), t.task_key, t.attempt_number or 0,
-                                  t.job_cluster_key, t.cluster_instance.cluster_id if t.cluster_instance else None,
-                                  _ts(t.start_time), xs, xe, (t.queue_duration or 0) // 1000, setup_ms // 1000,
+                                  getattr(t, "job_cluster_key", None), t.cluster_instance.cluster_id if getattr(t, "cluster_instance", None) else None,
+                                  _ts(t.start_time), xs, xe, (getattr(t, "queue_duration", None) or 0) // 1000, setup_ms // 1000,
                                   exec_ms // 1000, (t.cleanup_duration or 0) // 1000,
                                   bc.ev(t.state.result_state) if t.state else None, now))
             dur = int((et - st).total_seconds()) if st and et else None
